@@ -1,44 +1,69 @@
-FROM php:8.2-fpm-alpine as php
+# Stage 1: Base - Setup common dependencies and a non-root user
+FROM php:8.4-fpm-alpine AS base
 
-RUN apk add --no-cache unzip libpq-dev gnutls-dev autoconf build-base \
+RUN apk add --no-cache libpq-dev gnutls-dev autoconf build-base zlib-dev libzip-dev \
     curl-dev nginx supervisor shadow bash
-RUN docker-php-ext-install pdo pdo_mysql
-RUN pecl install pcov && docker-php-ext-enable pcov
+
+RUN addgroup --system --gid 1000 appgroup
+RUN adduser --system --ingroup appgroup --uid 1000 appuser
 
 WORKDIR /app
 
-# Setup PHP-FPM.
 COPY docker/php/php.ini $PHP_INI_DIR/
 COPY docker/php/php-fpm.conf /usr/local/etc/php-fpm.d/www.conf
 COPY docker/php/conf.d/opcache.ini $PHP_INI_DIR/conf.d/opcache.ini
 
-RUN addgroup --system --gid 1000 customgroup
-RUN adduser --system --ingroup customgroup --uid 1000 customuser
-
-# Setup nginx.
 COPY docker/nginx/nginx.conf docker/nginx/fastcgi_params docker/nginx/fastcgi_fpm docker/nginx/gzip_params /etc/nginx/
-RUN mkdir -p /var/lib/nginx/tmp /var/log/nginx
+RUN mkdir -p /var/lib/nginx/tmp /var/log/nginx /run/nginx /var/run/supervisor
 RUN /usr/sbin/nginx -t -c /etc/nginx/nginx.conf
 
-# setup nginx user permissions
-RUN chown -R customuser:customgroup /var/lib/nginx /var/log/nginx
-RUN chown -R customuser:customgroup /usr/local/etc/php-fpm.d
+RUN chown -R appuser:appgroup /var/lib/nginx /var/log/nginx /run/nginx
+RUN chown -R appuser:appgroup /usr/local/etc/php-fpm.d
+RUN chown -R appuser:appgroup /var/run/supervisor
 
-# Setup supervisor.
 COPY docker/supervisor/supervisord.conf /etc/supervisor/supervisord.conf
 
-# Copy application sources into the container.
-COPY --chown=customuser:customgroup . .
-RUN chown -R customuser:customgroup /app
-RUN chmod +w /app/public
-RUN chown -R customuser:customgroup /var /run
+USER appuser
 
-# disable root user
+
+# Stage 2: Build - Install Composer dependencies and compile assets
+FROM base AS build
+
+USER root
+
+RUN apk add --no-cache unzip nodejs npm
+
+RUN docker-php-ext-install pdo pdo_pgsql zip
+
+COPY --from=composer /usr/bin/composer /usr/bin/composer
+
+COPY . .
+
+RUN composer install --no-dev --optimize-autoloader --no-interaction
+
+RUN npm install
+
+RUN npm run build
+
+
+# Stage 3: Production - Create the final, lean production image
+FROM base AS production
+
+COPY --from=build /app /app
+
+USER root
+
+RUN chown -R appuser:appgroup storage bootstrap/cache
+
 RUN passwd -l root
 RUN usermod -s /usr/sbin/nologin root
 
-USER customuser
-COPY --from=composer:2.7.6 /usr/bin/composer /usr/bin/composer
+USER appuser
+
+# Run Laravel optimization commands.
+RUN php artisan config:cache && \
+    php artisan route:cache && \
+    php artisan view:cache
 
 ENTRYPOINT ["docker/entrypoint.sh"]
 
